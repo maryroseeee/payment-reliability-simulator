@@ -63,12 +63,12 @@ def test_matching_completed_retry_returns_the_original_payment(
     processor.process.assert_not_called()
 
 
-@pytest.mark.parametrize("original_status", ["processing", "succeeded"])
+@pytest.mark.parametrize("original_status", ["processing", "succeeded", "declined"])
 def test_changed_amount_is_a_conflict_regardless_of_original_status(
     store, processor, original_payment, original_status
 ):
     original_payment.status = original_status
-    if original_status == "processing":
+    if original_status != "succeeded":
         original_payment.processor_transaction_id = None
     store.get_by_idempotency_key.return_value = original_payment
     changed_request = PaymentRequest(amount=Decimal("40.00"), currency="USD")
@@ -192,3 +192,270 @@ def test_failed_state_update_does_not_return_a_successful_payment(
         PaymentService(store, processor).process_payment("order-42", payment_request)
 
     assert claimed.status == "processing"
+
+
+def test_new_decline_is_saved_as_a_known_outcome(store, processor, payment_request):
+    claimed = Payment(amount=payment_request.amount, currency=payment_request.currency)
+    declined = Payment(
+        id=claimed.id,
+        amount=claimed.amount,
+        currency=claimed.currency,
+        status="declined",
+    )
+    store.claim.return_value = claimed
+    processor.process.return_value = ProcessorResult(status="declined")
+    store.mark_declined.return_value = declined
+    sequence = Mock()
+    sequence.attach_mock(store, "store")
+    sequence.attach_mock(processor, "processor")
+
+    result = PaymentService(store, processor).process_payment("order-42", payment_request)
+
+    assert result.id == claimed.id
+    assert result.status == "declined"
+    assert result.processor_transaction_id is None
+    assert sequence.mock_calls == [
+        call.store.claim("order-42", payment_request),
+        call.processor.process(
+            payment_id=claimed.id,
+            amount=claimed.amount,
+            currency=claimed.currency,
+            idempotency_key="order-42",
+        ),
+        call.store.mark_declined(claimed.id),
+    ]
+
+
+def test_declined_retry_returns_the_original_without_another_attempt(
+    store, processor, payment_request, original_payment
+):
+    original_payment.status = "declined"
+    original_payment.processor_transaction_id = None
+    store.claim.return_value = None
+    store.get_by_idempotency_key.return_value = original_payment
+
+    result = PaymentService(store, processor).process_payment("order-42", payment_request)
+
+    assert result.id == original_payment.id
+    assert result.status == "declined"
+    assert result.processor_transaction_id is None
+    processor.process.assert_not_called()
+    store.mark_succeeded.assert_not_called()
+    store.mark_declined.assert_not_called()
+
+
+def test_decline_with_a_transaction_reference_is_not_replayed(
+    store, processor, payment_request, original_payment
+):
+    original_payment.status = "declined"
+    store.get_by_idempotency_key.return_value = original_payment
+
+    with pytest.raises(PaymentStateError):
+        PaymentService(store, processor).resolve_retry("order-42", payment_request)
+
+    processor.process.assert_not_called()
+
+
+def test_failed_decline_update_does_not_return_a_declined_payment(
+    store, processor, payment_request
+):
+    claimed = Payment(amount=payment_request.amount, currency=payment_request.currency)
+    store.claim.return_value = claimed
+    processor.process.return_value = ProcessorResult(status="declined")
+    store.mark_declined.return_value = None
+
+    with pytest.raises(PaymentStateError):
+        PaymentService(store, processor).process_payment("order-42", payment_request)
+
+    store.mark_succeeded.assert_not_called()
+    assert claimed.status == "processing"
+
+
+@pytest.mark.parametrize("outcome", ["succeeded", "declined"])
+def test_recovery_saves_the_existing_processors_confirmation(
+    store, processor, payment_request, outcome
+):
+    original = Payment(amount=payment_request.amount, currency=payment_request.currency)
+    transaction_id = uuid4() if outcome == "succeeded" else None
+    confirmation = ProcessorResult(status=outcome, transaction_id=transaction_id)
+    completed = Payment(
+        id=original.id,
+        amount=original.amount,
+        currency=original.currency,
+        status=outcome,
+        processor_transaction_id=transaction_id,
+    )
+    store.get_by_idempotency_key.return_value = original
+    processor.get_result.return_value = confirmation
+    if outcome == "succeeded":
+        store.mark_succeeded.return_value = completed
+    else:
+        store.mark_declined.return_value = completed
+
+    result = PaymentService(store, processor).recover_payment("order-42")
+
+    assert result.id == original.id
+    assert result.amount == original.amount
+    assert result.currency == original.currency
+    assert result.status == outcome
+    assert result.processor_transaction_id == transaction_id
+    processor.get_result.assert_called_once_with("order-42")
+    processor.process.assert_not_called()
+    store.claim.assert_not_called()
+    if outcome == "succeeded":
+        store.mark_succeeded.assert_called_once_with(original.id, transaction_id)
+        store.mark_declined.assert_not_called()
+    else:
+        store.mark_declined.assert_called_once_with(original.id)
+        store.mark_succeeded.assert_not_called()
+
+
+def test_recovery_without_confirmation_keeps_the_payment_unresolved(
+    store, processor, payment_request
+):
+    original = Payment(amount=payment_request.amount, currency=payment_request.currency)
+    store.get_by_idempotency_key.return_value = original
+    processor.get_result.return_value = None
+
+    result = PaymentService(store, processor).recover_payment("order-42")
+
+    assert result.id == original.id
+    assert result.status == "processing"
+    assert result.processor_transaction_id is None
+    processor.get_result.assert_called_once_with("order-42")
+    processor.process.assert_not_called()
+    store.claim.assert_not_called()
+    store.mark_succeeded.assert_not_called()
+    store.mark_declined.assert_not_called()
+
+
+@pytest.mark.parametrize("outcome", ["succeeded", "declined"])
+def test_repeated_recovery_returns_a_completed_record_without_processor_calls(
+    store, processor, payment_request, outcome
+):
+    original = Payment(
+        amount=payment_request.amount,
+        currency=payment_request.currency,
+        status=outcome,
+        processor_transaction_id=uuid4() if outcome == "succeeded" else None,
+    )
+    store.get_by_idempotency_key.return_value = original
+
+    result = PaymentService(store, processor).recover_payment("order-42")
+
+    assert result.id == original.id
+    assert result.status == outcome
+    assert result.processor_transaction_id == original.processor_transaction_id
+    processor.get_result.assert_not_called()
+    processor.process.assert_not_called()
+    store.claim.assert_not_called()
+    store.mark_succeeded.assert_not_called()
+    store.mark_declined.assert_not_called()
+
+
+def test_recovery_does_not_create_a_missing_internal_payment(store, processor):
+    store.get_by_idempotency_key.return_value = None
+
+    with pytest.raises(PaymentRecordMissingError):
+        PaymentService(store, processor).recover_payment("unknown-key")
+
+    processor.get_result.assert_not_called()
+    processor.process.assert_not_called()
+    store.claim.assert_not_called()
+
+
+def test_recovery_lookup_error_does_not_change_the_payment(
+    store, processor, payment_request
+):
+    original = Payment(amount=payment_request.amount, currency=payment_request.currency)
+    store.get_by_idempotency_key.return_value = original
+    processor.get_result.side_effect = ProcessorError("Lookup is unavailable.")
+
+    with pytest.raises(ProcessorError):
+        PaymentService(store, processor).recover_payment("order-42")
+
+    assert original.status == "processing"
+    processor.process.assert_not_called()
+    store.claim.assert_not_called()
+    store.mark_succeeded.assert_not_called()
+    store.mark_declined.assert_not_called()
+
+
+def test_recovery_does_not_report_completion_when_the_save_did_not_apply(
+    store, processor, payment_request
+):
+    original = Payment(amount=payment_request.amount, currency=payment_request.currency)
+    store.get_by_idempotency_key.return_value = original
+    processor.get_result.return_value = ProcessorResult(transaction_id=uuid4())
+    store.mark_succeeded.return_value = None
+
+    with pytest.raises(PaymentStateError):
+        PaymentService(store, processor).recover_payment("order-42")
+
+    processor.process.assert_not_called()
+    store.claim.assert_not_called()
+
+
+@pytest.mark.parametrize("outcome", ["succeeded", "declined"])
+def test_concurrent_recovery_accepts_the_same_outcome_already_saved(
+    store, processor, payment_request, outcome
+):
+    original = Payment(amount=payment_request.amount, currency=payment_request.currency)
+    transaction_id = uuid4() if outcome == "succeeded" else None
+    confirmation = ProcessorResult(status=outcome, transaction_id=transaction_id)
+    already_saved = Payment(
+        id=original.id,
+        amount=original.amount,
+        currency=original.currency,
+        status=outcome,
+        processor_transaction_id=transaction_id,
+    )
+    store.get_by_idempotency_key.side_effect = [original, already_saved]
+    processor.get_result.return_value = confirmation
+    store.mark_succeeded.return_value = None
+    store.mark_declined.return_value = None
+
+    result = PaymentService(store, processor).recover_payment("order-42")
+
+    assert result.model_dump() == already_saved.model_dump()
+    assert store.get_by_idempotency_key.call_args_list == [
+        call("order-42"), call("order-42")
+    ]
+    processor.get_result.assert_called_once_with("order-42")
+    processor.process.assert_not_called()
+    store.claim.assert_not_called()
+
+
+@pytest.mark.parametrize("difference", ["transaction_id", "status", "payment_id", "amount"])
+def test_recovery_rejects_a_conflicting_saved_record(
+    store, processor, payment_request, difference
+):
+    original = Payment(amount=payment_request.amount, currency=payment_request.currency)
+    confirmation = ProcessorResult(transaction_id=uuid4())
+    conflicting = Payment(
+        id=original.id,
+        amount=original.amount,
+        currency=original.currency,
+        status="succeeded",
+        processor_transaction_id=confirmation.transaction_id,
+    )
+    if difference == "transaction_id":
+        conflicting.processor_transaction_id = uuid4()
+    elif difference == "status":
+        conflicting.status = "declined"
+        conflicting.processor_transaction_id = None
+    elif difference == "payment_id":
+        conflicting.id = uuid4()
+    else:
+        conflicting.amount = Decimal("40.00")
+    before = conflicting.model_dump()
+    store.get_by_idempotency_key.side_effect = [original, conflicting]
+    processor.get_result.return_value = confirmation
+    store.mark_succeeded.return_value = None
+
+    with pytest.raises(PaymentStateError):
+        PaymentService(store, processor).recover_payment("order-42")
+
+    assert conflicting.model_dump() == before
+    processor.process.assert_not_called()
+    store.claim.assert_not_called()

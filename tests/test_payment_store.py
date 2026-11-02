@@ -188,3 +188,57 @@ def test_processor_transaction_cannot_be_linked_to_two_payments(idempotency_keys
     row = stored_payment(idempotency_keys[1])
     assert row["status"] == "processing"
     assert row["processor_transaction_id"] is None
+
+
+def test_decline_is_committed_without_changing_another_payment(idempotency_keys):
+    store = PaymentStore(engine)
+    request = PaymentRequest.model_validate({"amount": "25.00", "currency": "USD"})
+    original = store.claim(idempotency_keys[0], request)
+    other = store.claim(idempotency_keys[1], request)
+    assert original is not None
+    assert other is not None
+
+    with engine.connect() as observer:
+        declined = store.mark_declined(original.id)
+        row = observer.execute(
+            select(PaymentRecord).where(PaymentRecord.id == original.id)
+        ).mappings().one()
+
+    assert declined is not None
+    assert declined.id == original.id
+    assert declined.amount == Decimal("25.00")
+    assert declined.currency == "USD"
+    assert declined.status == "declined"
+    assert declined.processor_transaction_id is None
+    assert row["status"] == "declined"
+    assert row["processor_transaction_id"] is None
+    assert stored_payment(idempotency_keys[1])["status"] == "processing"
+
+
+def test_successful_payment_cannot_be_changed_to_a_decline(idempotency_key):
+    store = PaymentStore(engine)
+    request = PaymentRequest.model_validate({"amount": "25.00", "currency": "USD"})
+    original = store.claim(idempotency_key, request)
+    assert original is not None
+    transaction_id = uuid4()
+    assert store.mark_succeeded(original.id, transaction_id) is not None
+
+    assert store.mark_declined(original.id) is None
+    row = stored_payment(idempotency_key)
+    assert row["status"] == "succeeded"
+    assert row["processor_transaction_id"] == transaction_id
+
+
+def test_declined_payment_cannot_be_transitioned_again(idempotency_key):
+    store = PaymentStore(engine)
+    request = PaymentRequest.model_validate({"amount": "25.00", "currency": "USD"})
+    original = store.claim(idempotency_key, request)
+    assert original is not None
+    assert store.mark_declined(original.id) is not None
+
+    assert store.mark_declined(original.id) is None
+    assert store.mark_succeeded(original.id, uuid4()) is None
+    row = stored_payment(idempotency_key)
+    assert row["id"] == original.id
+    assert row["status"] == "declined"
+    assert row["processor_transaction_id"] is None

@@ -78,3 +78,23 @@ class PaymentStore:
             payment = Payment.model_validate(row)
 
         return payment
+
+    def mark_declined(self, payment_id: UUID) -> Payment | None:
+        """Commit processing -> declined, or return None if it cannot apply."""
+        statement = (
+            update(PaymentRecord)
+            .where(
+                PaymentRecord.id == payment_id,
+                PaymentRecord.status == "processing",
+            )
+            .values(status="declined", processor_transaction_id=None)
+            .returning(PaymentRecord)
+        )
+
+        with self.engine.begin() as connection:
+            row = connection.execute(statement).mappings().one_or_none()
+            if row is None:
+                return None
+            payment = Payment.model_validate(row)
+
+        return payment

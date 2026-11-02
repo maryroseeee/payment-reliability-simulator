@@ -213,3 +213,251 @@ def test_processor_error_leaves_processing_and_does_not_blindly_retry(
     assert stored.status == "processing"
     assert stored.processor_transaction_id is None
     assert process.call_count == 1
+
+
+def test_decline_is_saved_and_replayed_without_another_attempt(
+    client, api_processor, idempotency_key, monkeypatch
+):
+    api_processor.decline = True
+    process = Mock(wraps=api_processor.process)
+    monkeypatch.setattr(api_processor, "process", process)
+    headers = {"Idempotency-Key": idempotency_key}
+    payload = {"amount": "25.00", "currency": "USD"}
+
+    original = client.post("/payments", headers=headers, json=payload)
+    api_processor.decline = False
+    retry = client.post("/payments", headers=headers, json=payload)
+
+    assert original.status_code == 201
+    assert original.json()["status"] == "declined"
+    assert original.json()["processor_transaction_id"] is None
+    assert retry.status_code == 201
+    assert retry.json() == original.json()
+    assert process.call_count == 1
+    assert api_processor.charge_count == 0
+    stored = PaymentStore(engine).get_by_idempotency_key(idempotency_key)
+    assert stored is not None
+    assert str(stored.id) == original.json()["id"]
+    assert stored.status == "declined"
+    assert stored.processor_transaction_id is None
+
+
+def test_new_key_creates_a_new_attempt_and_preserves_the_original_decline(
+    client, api_processor, idempotency_keys
+):
+    payload = {"amount": "25.00", "currency": "USD"}
+    api_processor.decline = True
+    original = client.post(
+        "/payments", headers={"Idempotency-Key": idempotency_keys[0]}, json=payload
+    )
+
+    api_processor.decline = False
+    new_attempt = client.post(
+        "/payments", headers={"Idempotency-Key": idempotency_keys[1]}, json=payload
+    )
+    original_retry = client.post(
+        "/payments", headers={"Idempotency-Key": idempotency_keys[0]}, json=payload
+    )
+
+    assert original.status_code == 201
+    assert original.json()["status"] == "declined"
+    assert new_attempt.status_code == 201
+    assert new_attempt.json()["status"] == "succeeded"
+    assert new_attempt.json()["processor_transaction_id"]
+    assert new_attempt.json()["id"] != original.json()["id"]
+    assert original_retry.json() == original.json()
+    assert api_processor.charge_count == 1
+    stored = PaymentStore(engine).get_by_idempotency_key(idempotency_keys[0])
+    assert stored is not None
+    assert stored.status == "declined"
+    assert str(stored.id) == original.json()["id"]
+
+
+def test_lost_response_leaves_an_unresolved_payment_and_only_one_charge(
+    client, api_processor, idempotency_key, monkeypatch
+):
+    api_processor.lose_response = True
+    process = Mock(wraps=api_processor.process)
+    monkeypatch.setattr(api_processor, "process", process)
+    payload = {"amount": "25.00", "currency": "USD"}
+    headers = {"Idempotency-Key": idempotency_key}
+
+    failure = client.post("/payments", headers=headers, json=payload)
+
+    assert failure.status_code == 503
+    assert failure.json()["detail"]["code"] == "outcome_unconfirmed"
+    assert api_processor.charge_count == 1
+    stored = PaymentStore(engine).get_by_idempotency_key(idempotency_key)
+    assert stored is not None
+    assert stored.status == "processing"
+    assert stored.processor_transaction_id is None
+
+    provider_result = api_processor.get_result(idempotency_key)
+    assert provider_result is not None
+    assert provider_result.status == "succeeded"
+    assert provider_result.transaction_id is not None
+
+    retry = client.post("/payments", headers=headers, json=payload)
+
+    assert retry.status_code == 409
+    assert retry.json()["detail"]["code"] == "payment_in_progress"
+    assert process.call_count == 1
+    assert api_processor.charge_count == 1
+    unresolved = PaymentStore(engine).get_by_idempotency_key(idempotency_key)
+    assert unresolved is not None
+    assert unresolved.id == stored.id
+    assert unresolved.status == "processing"
+
+
+def test_recovery_saves_lost_success_without_another_charge(
+    client, api_processor, idempotency_key, monkeypatch
+):
+    api_processor.lose_response = True
+    process = Mock(wraps=api_processor.process)
+    monkeypatch.setattr(api_processor, "process", process)
+    payload = {"amount": "25.00", "currency": "USD"}
+    headers = {"Idempotency-Key": idempotency_key}
+
+    failure = client.post("/payments", headers=headers, json=payload)
+
+    assert failure.status_code == 503
+    assert failure.json()["detail"]["code"] == "outcome_unconfirmed"
+    assert api_processor.charge_count == 1
+    stored = PaymentStore(engine).get_by_idempotency_key(idempotency_key)
+    assert stored is not None
+    assert stored.status == "processing"
+    assert stored.processor_transaction_id is None
+    provider_result = api_processor.get_result(idempotency_key)
+    assert provider_result is not None
+    assert provider_result.status == "succeeded"
+    assert provider_result.transaction_id is not None
+
+    response = client.post("/payments/recover", headers=headers)
+
+    assert response.status_code == 200
+    recovered = response.json()
+    assert recovered["status"] == "succeeded"
+    assert recovered["id"] == str(stored.id)
+    assert recovered["amount"] == "25.00"
+    assert recovered["currency"] == "USD"
+    assert recovered["processor_transaction_id"] == str(provider_result.transaction_id)
+    saved = PaymentStore(engine).get_by_idempotency_key(idempotency_key)
+    assert saved is not None
+    assert saved.id == stored.id
+    assert saved.status == "succeeded"
+    assert saved.processor_transaction_id == provider_result.transaction_id
+
+    repeated = client.post("/payments/recover", headers=headers)
+    assert repeated.status_code == 200
+    assert repeated.json() == recovered
+    assert process.call_count == 1
+    assert api_processor.charge_count == 1
+
+
+def test_recovery_restores_a_lost_decline_without_a_charge(
+    client, api_processor, idempotency_key, monkeypatch
+):
+    api_processor.decline = True
+    api_processor.lose_response = True
+    process = Mock(wraps=api_processor.process)
+    monkeypatch.setattr(api_processor, "process", process)
+    headers = {"Idempotency-Key": idempotency_key}
+    payload = {"amount": "25.00", "currency": "USD"}
+    failure = client.post("/payments", headers=headers, json=payload)
+    stored = PaymentStore(engine).get_by_idempotency_key(idempotency_key)
+    assert failure.status_code == 503
+    assert stored is not None
+    assert stored.status == "processing"
+
+    response = client.post("/payments/recover", headers=headers)
+
+    assert response.status_code == 200
+    assert response.json()["id"] == str(stored.id)
+    assert response.json()["status"] == "declined"
+    assert response.json()["processor_transaction_id"] is None
+    saved = PaymentStore(engine).get_by_idempotency_key(idempotency_key)
+    assert saved is not None
+    assert saved.status == "declined"
+    assert saved.processor_transaction_id is None
+    assert process.call_count == 1
+    assert api_processor.charge_count == 0
+
+
+def test_recovery_without_provider_confirmation_returns_processing(
+    client, api_processor, idempotency_key, monkeypatch
+):
+    process = Mock(wraps=api_processor.process)
+    monkeypatch.setattr(api_processor, "process", process)
+    request = PaymentRequest.model_validate({"amount": "25.00", "currency": "USD"})
+    original = PaymentStore(engine).claim(idempotency_key, request)
+    assert original is not None
+
+    response = client.post(
+        "/payments/recover", headers={"Idempotency-Key": idempotency_key}
+    )
+
+    assert response.status_code == 200
+    assert response.json()["id"] == str(original.id)
+    assert response.json()["status"] == "processing"
+    assert response.json()["processor_transaction_id"] is None
+    saved = PaymentStore(engine).get_by_idempotency_key(idempotency_key)
+    assert saved is not None
+    assert saved.status == "processing"
+    process.assert_not_called()
+    assert api_processor.charge_count == 0
+
+
+def test_recovery_unknown_key_returns_not_found_without_processing(
+    client, api_processor, idempotency_key, monkeypatch
+):
+    process = Mock(wraps=api_processor.process)
+    monkeypatch.setattr(api_processor, "process", process)
+
+    response = client.post(
+        "/payments/recover", headers={"Idempotency-Key": idempotency_key}
+    )
+
+    assert response.status_code == 404
+    assert response.json()["detail"]["code"] == "payment_not_found"
+    assert PaymentStore(engine).get_by_idempotency_key(idempotency_key) is None
+    process.assert_not_called()
+    assert api_processor.charge_count == 0
+
+
+def test_recovery_lookup_failure_returns_unconfirmed_and_keeps_processing(
+    client, api_processor, idempotency_key, monkeypatch
+):
+    process = Mock(wraps=api_processor.process)
+    monkeypatch.setattr(api_processor, "process", process)
+    lookup = Mock(side_effect=ProcessorError("Processor lookup is unavailable."))
+    monkeypatch.setattr(api_processor, "get_result", lookup)
+    request = PaymentRequest.model_validate({"amount": "25.00", "currency": "USD"})
+    original = PaymentStore(engine).claim(idempotency_key, request)
+    assert original is not None
+
+    response = client.post(
+        "/payments/recover", headers={"Idempotency-Key": idempotency_key}
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "outcome_unconfirmed"
+    saved = PaymentStore(engine).get_by_idempotency_key(idempotency_key)
+    assert saved is not None
+    assert saved.id == original.id
+    assert saved.status == "processing"
+    assert saved.processor_transaction_id is None
+    process.assert_not_called()
+    assert api_processor.charge_count == 0
+
+
+@pytest.mark.parametrize("key", [None, "", "   "])
+def test_recovery_requires_a_nonblank_idempotency_key(client, key):
+    service = create_autospec(PaymentService, instance=True)
+    app.dependency_overrides[get_payment_service] = lambda: service
+    headers = {} if key is None else {"Idempotency-Key": key}
+
+    response = client.post("/payments/recover", headers=headers)
+
+    assert response.status_code == 422
+    service.recover_payment.assert_not_called()
+    service.process_payment.assert_not_called()

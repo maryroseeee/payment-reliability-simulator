@@ -18,5 +18,5 @@ class Payment(BaseModel):
     id: UUID = Field(default_factory=uuid4)
     amount: Decimal = Field(gt=0, decimal_places=2)
     currency: Literal["USD"]
-    status: Literal["processing", "succeeded"] = "processing"
+    status: Literal["processing", "succeeded", "declined"] = "processing"
     processor_transaction_id: UUID | None = None
