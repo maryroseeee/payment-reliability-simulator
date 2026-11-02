@@ -19,3 +19,4 @@ class Payment(BaseModel):
     amount: Decimal = Field(gt=0, decimal_places=2)
     currency: Literal["USD"]
     status: Literal["processing", "succeeded"] = "processing"
+    processor_transaction_id: UUID | None = None
