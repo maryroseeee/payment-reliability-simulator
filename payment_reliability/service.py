@@ -64,6 +64,15 @@ class PaymentService:
         self, idempotency_key: str, payment: Payment, confirmation: ProcessorResult
     ) -> Payment:
         """Use the same guarded state transitions for processing and recovery."""
+        if (
+            confirmation.payment_id != payment.id
+            or confirmation.amount != payment.amount
+            or confirmation.currency != payment.currency
+        ):
+            raise PaymentStateError(
+                "The processor confirmation does not match the stored payment."
+            )
+
         if confirmation.status == "succeeded" and confirmation.transaction_id is not None:
             completed = self.store.mark_succeeded(payment.id, confirmation.transaction_id)
         elif confirmation.status == "declined" and confirmation.transaction_id is None:

@@ -6,6 +6,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from payment_reliability.database import engine
 from payment_reliability.processor import ProcessorError, SimulatedPaymentProcessor
+from payment_reliability.processor_store import ProcessorStore
 from payment_reliability.schemas import Payment, PaymentRequest
 from payment_reliability.service import (
     IdempotencyConflictError,
@@ -19,6 +20,7 @@ from payment_reliability.store import PaymentStore
 
 app = FastAPI(title="Payment Reliability & Reconciliation Simulator")
 _processor = SimulatedPaymentProcessor(
+    ProcessorStore(engine),
     decline=os.getenv("SIMULATE_DECLINES", "0") == "1",
     lose_response=os.getenv("SIMULATE_LOST_RESPONSE", "0") == "1",
 )

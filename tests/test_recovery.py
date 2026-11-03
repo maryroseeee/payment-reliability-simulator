@@ -9,6 +9,7 @@ import pytest
 
 from payment_reliability.database import engine
 from payment_reliability.processor import ProcessorTimeoutError, SimulatedPaymentProcessor
+from payment_reliability.processor_store import ProcessorStore
 from payment_reliability.schemas import PaymentRequest
 from payment_reliability.service import PaymentService
 from payment_reliability.store import PaymentStore
@@ -16,9 +17,9 @@ from payment_reliability.store import PaymentStore
 
 @pytest.mark.parametrize("decline", [False, True])
 def test_recovery_restores_a_lost_outcome_without_another_attempt(
-    idempotency_key, monkeypatch, decline
+    idempotency_key, monkeypatch, decline, provider_store
 ):
-    processor = SimulatedPaymentProcessor(decline=decline, lose_response=True)
+    processor = SimulatedPaymentProcessor(provider_store, decline=decline, lose_response=True)
     process = Mock(wraps=processor.process)
     monkeypatch.setattr(processor, "process", process)
     store = PaymentStore(engine)
@@ -55,8 +56,13 @@ def test_recovery_restores_a_lost_outcome_without_another_attempt(
     assert processor.charge_count == expected_charges
 
 
-def test_missing_provider_history_does_not_trigger_another_payment(idempotency_key):
-    original_processor = SimulatedPaymentProcessor(lose_response=True)
+@pytest.mark.parametrize("decline", [False, True])
+def test_fresh_processor_recovers_persisted_history_without_another_attempt(
+    idempotency_key, provider_store, monkeypatch, decline
+):
+    original_processor = SimulatedPaymentProcessor(
+        provider_store, decline=decline, lose_response=True
+    )
     store = PaymentStore(engine)
     request = PaymentRequest(amount=Decimal("25.00"), currency="USD")
 
@@ -64,25 +70,55 @@ def test_missing_provider_history_does_not_trigger_another_payment(idempotency_k
         PaymentService(store, original_processor).process_payment(idempotency_key, request)
     unresolved = store.get_by_idempotency_key(idempotency_key)
     assert unresolved is not None
-    fresh_processor = SimulatedPaymentProcessor()
+    confirmation = original_processor.get_result(idempotency_key)
+    assert confirmation is not None
+    # A fresh instance uses the default success setting, but must preserve declines.
+    fresh_processor = SimulatedPaymentProcessor(ProcessorStore(provider_store.engine))
+    process = Mock(wraps=fresh_processor.process)
+    monkeypatch.setattr(fresh_processor, "process", process)
 
     result = PaymentService(store, fresh_processor).recover_payment(idempotency_key)
 
     assert result.id == unresolved.id
-    assert result.status == "processing"
-    assert result.processor_transaction_id is None
-    assert original_processor.charge_count == 1
-    assert fresh_processor.charge_count == 0
+    assert result.status == confirmation.status
+    assert result.processor_transaction_id == confirmation.transaction_id
+    assert original_processor.charge_count == (0 if decline else 1)
+    assert fresh_processor.charge_count == (0 if decline else 1)
+    process.assert_not_called()
     persisted = store.get_by_idempotency_key(idempotency_key)
     assert persisted is not None
-    assert persisted.status == "processing"
+    assert persisted.model_dump() == result.model_dump()
+
+
+def test_missing_provider_history_does_not_trigger_another_payment(
+    idempotency_key, provider_store, monkeypatch
+):
+    store = PaymentStore(engine)
+    original = store.claim(
+        idempotency_key, PaymentRequest(amount=Decimal("25.00"), currency="USD")
+    )
+    assert original is not None
+    processor = SimulatedPaymentProcessor(provider_store)
+    process = Mock(wraps=processor.process)
+    monkeypatch.setattr(processor, "process", process)
+
+    result = PaymentService(store, processor).recover_payment(idempotency_key)
+
+    assert result.model_dump() == original.model_dump()
+    assert result.status == "processing"
+    assert processor.get_result(idempotency_key) is None
+    assert processor.charge_count == 0
+    process.assert_not_called()
+    persisted = store.get_by_idempotency_key(idempotency_key)
+    assert persisted is not None
+    assert persisted.model_dump() == original.model_dump()
 
 
 @pytest.mark.parametrize("decline", [False, True])
 def test_concurrent_recoveries_return_the_same_saved_outcome(
-    idempotency_key, monkeypatch, decline
+    idempotency_key, monkeypatch, decline, provider_store
 ):
-    processor = SimulatedPaymentProcessor(decline=decline, lose_response=True)
+    processor = SimulatedPaymentProcessor(provider_store, decline=decline, lose_response=True)
     process = Mock(wraps=processor.process)
     monkeypatch.setattr(processor, "process", process)
     store = PaymentStore(engine)

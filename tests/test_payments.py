@@ -1,6 +1,8 @@
 from concurrent.futures import ThreadPoolExecutor
+from decimal import Decimal
 from threading import Event
 from unittest.mock import Mock, create_autospec
+from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
@@ -8,14 +10,15 @@ from fastapi.testclient import TestClient
 from payment_reliability.database import engine
 from payment_reliability.main import app, get_payment_service
 from payment_reliability.processor import ProcessorError, SimulatedPaymentProcessor
+from payment_reliability.processor_store import ProcessorStore
 from payment_reliability.schemas import PaymentRequest
 from payment_reliability.service import PaymentService
 from payment_reliability.store import PaymentStore
 
 
 @pytest.fixture
-def api_processor():
-    return SimulatedPaymentProcessor()
+def api_processor(provider_store):
+    return SimulatedPaymentProcessor(provider_store)
 
 
 @pytest.fixture
@@ -135,11 +138,15 @@ def test_api_requires_a_nonblank_idempotency_key(client, key):
     service.process_payment.assert_not_called()
 
 
-def test_fresh_service_replays_the_persisted_payment(client, api_processor, idempotency_key):
+def test_fresh_service_replays_the_persisted_payment(
+    client, api_processor, idempotency_key, provider_store, monkeypatch
+):
     payload = {"amount": "25.00", "currency": "USD"}
     headers = {"Idempotency-Key": idempotency_key}
     original = client.post("/payments", headers=headers, json=payload)
-    fresh_processor = SimulatedPaymentProcessor()
+    fresh_processor = SimulatedPaymentProcessor(ProcessorStore(provider_store.engine))
+    process = Mock(wraps=fresh_processor.process)
+    monkeypatch.setattr(fresh_processor, "process", process)
     fresh_service = PaymentService(PaymentStore(engine), fresh_processor)
     app.dependency_overrides[get_payment_service] = lambda: fresh_service
 
@@ -149,7 +156,8 @@ def test_fresh_service_replays_the_persisted_payment(client, api_processor, idem
     assert retry.status_code == 201
     assert retry.json() == original.json()
     assert api_processor.charge_count == 1
-    assert fresh_processor.charge_count == 0
+    assert fresh_processor.charge_count == 1
+    process.assert_not_called()
 
 
 def test_duplicate_request_during_processing_does_not_start_another_charge(
@@ -448,6 +456,46 @@ def test_recovery_lookup_failure_returns_unconfirmed_and_keeps_processing(
     assert saved.processor_transaction_id is None
     process.assert_not_called()
     assert api_processor.charge_count == 0
+
+
+@pytest.mark.parametrize("difference", ["amount", "payment_id"])
+@pytest.mark.parametrize("outcome", ["succeeded", "declined"])
+def test_recovery_rejects_disagreeing_provider_records_without_changing_them(
+    client, api_processor, idempotency_key, monkeypatch, difference, outcome
+):
+    store = PaymentStore(engine)
+    original = store.claim(
+        idempotency_key, PaymentRequest(amount=Decimal("25.00"), currency="USD")
+    )
+    assert original is not None
+    provider_details = {
+        "payment_id": original.id,
+        "amount": original.amount,
+        "currency": original.currency,
+        "idempotency_key": idempotency_key,
+    }
+    provider_details[difference] = (
+        Decimal("40.00") if difference == "amount" else uuid4()
+    )
+    api_processor.decline = outcome == "declined"
+    confirmation = api_processor.process(**provider_details)
+    process = Mock(wraps=api_processor.process)
+    monkeypatch.setattr(api_processor, "process", process)
+
+    for _ in range(2):
+        response = client.post(
+            "/payments/recover", headers={"Idempotency-Key": idempotency_key}
+        )
+
+        assert response.status_code == 503
+        assert response.json()["detail"]["code"] == "outcome_unconfirmed"
+        saved = store.get_by_idempotency_key(idempotency_key)
+        assert saved is not None
+        assert saved.model_dump() == original.model_dump()
+        assert api_processor.get_result(idempotency_key) == confirmation
+        assert api_processor.charge_count == (1 if outcome == "succeeded" else 0)
+
+    process.assert_not_called()
 
 
 @pytest.mark.parametrize("key", [None, "", "   "])

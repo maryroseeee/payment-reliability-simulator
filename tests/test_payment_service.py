@@ -122,7 +122,10 @@ def test_new_payment_claims_then_processes_then_saves_confirmation(
     store, processor, payment_request
 ):
     claimed = Payment(amount=payment_request.amount, currency=payment_request.currency)
-    confirmation = ProcessorResult(transaction_id=uuid4())
+    confirmation = ProcessorResult(
+        payment_id=claimed.id, amount=claimed.amount, currency=claimed.currency,
+        transaction_id=uuid4(),
+    )
     completed = Payment(
         id=claimed.id,
         amount=claimed.amount,
@@ -185,7 +188,10 @@ def test_failed_state_update_does_not_return_a_successful_payment(
 ):
     claimed = Payment(amount=payment_request.amount, currency=payment_request.currency)
     store.claim.return_value = claimed
-    processor.process.return_value = ProcessorResult(transaction_id=uuid4())
+    processor.process.return_value = ProcessorResult(
+        payment_id=claimed.id, amount=claimed.amount, currency=claimed.currency,
+        transaction_id=uuid4(),
+    )
     store.mark_succeeded.return_value = None
 
     with pytest.raises(PaymentStateError):
@@ -203,7 +209,10 @@ def test_new_decline_is_saved_as_a_known_outcome(store, processor, payment_reque
         status="declined",
     )
     store.claim.return_value = claimed
-    processor.process.return_value = ProcessorResult(status="declined")
+    processor.process.return_value = ProcessorResult(
+        payment_id=claimed.id, amount=claimed.amount, currency=claimed.currency,
+        status="declined",
+    )
     store.mark_declined.return_value = declined
     sequence = Mock()
     sequence.attach_mock(store, "store")
@@ -261,7 +270,10 @@ def test_failed_decline_update_does_not_return_a_declined_payment(
 ):
     claimed = Payment(amount=payment_request.amount, currency=payment_request.currency)
     store.claim.return_value = claimed
-    processor.process.return_value = ProcessorResult(status="declined")
+    processor.process.return_value = ProcessorResult(
+        payment_id=claimed.id, amount=claimed.amount, currency=claimed.currency,
+        status="declined",
+    )
     store.mark_declined.return_value = None
 
     with pytest.raises(PaymentStateError):
@@ -277,7 +289,10 @@ def test_recovery_saves_the_existing_processors_confirmation(
 ):
     original = Payment(amount=payment_request.amount, currency=payment_request.currency)
     transaction_id = uuid4() if outcome == "succeeded" else None
-    confirmation = ProcessorResult(status=outcome, transaction_id=transaction_id)
+    confirmation = ProcessorResult(
+        payment_id=original.id, amount=original.amount, currency=original.currency,
+        status=outcome, transaction_id=transaction_id,
+    )
     completed = Payment(
         id=original.id,
         amount=original.amount,
@@ -327,6 +342,57 @@ def test_recovery_without_confirmation_keeps_the_payment_unresolved(
     store.claim.assert_not_called()
     store.mark_succeeded.assert_not_called()
     store.mark_declined.assert_not_called()
+
+
+@pytest.mark.parametrize("operation", ["process", "recover"])
+@pytest.mark.parametrize("outcome", ["succeeded", "declined"])
+@pytest.mark.parametrize("difference", ["payment_id", "amount", "currency"])
+def test_mismatched_provider_confirmation_never_changes_the_payment(
+    store, processor, payment_request, operation, outcome, difference
+):
+    original = Payment(amount=payment_request.amount, currency=payment_request.currency)
+    details = {
+        "payment_id": original.id,
+        "amount": original.amount,
+        "currency": original.currency,
+    }
+    details[difference] = {
+        "payment_id": uuid4(),
+        "amount": Decimal("40.00"),
+        "currency": "EUR",
+    }[difference]
+    confirmation = ProcessorResult(
+        **details,
+        status=outcome,
+        transaction_id=uuid4() if outcome == "succeeded" else None,
+    )
+    store.claim.return_value = original
+    store.get_by_idempotency_key.return_value = original
+    processor.process.return_value = confirmation
+    processor.get_result.return_value = confirmation
+    completed = original.model_copy(update={
+        "status": outcome,
+        "processor_transaction_id": confirmation.transaction_id,
+    })
+    store.mark_succeeded.return_value = completed
+    store.mark_declined.return_value = completed
+    service = PaymentService(store, processor)
+
+    with pytest.raises(PaymentStateError, match="confirmation does not match"):
+        if operation == "process":
+            service.process_payment("order-42", payment_request)
+        else:
+            service.recover_payment("order-42")
+
+    store.mark_succeeded.assert_not_called()
+    store.mark_declined.assert_not_called()
+    assert original.status == "processing"
+    assert original.processor_transaction_id is None
+    if operation == "recover":
+        processor.process.assert_not_called()
+        store.claim.assert_not_called()
+    else:
+        assert processor.process.call_count == 1
 
 
 @pytest.mark.parametrize("outcome", ["succeeded", "declined"])
@@ -386,7 +452,10 @@ def test_recovery_does_not_report_completion_when_the_save_did_not_apply(
 ):
     original = Payment(amount=payment_request.amount, currency=payment_request.currency)
     store.get_by_idempotency_key.return_value = original
-    processor.get_result.return_value = ProcessorResult(transaction_id=uuid4())
+    processor.get_result.return_value = ProcessorResult(
+        payment_id=original.id, amount=original.amount, currency=original.currency,
+        transaction_id=uuid4(),
+    )
     store.mark_succeeded.return_value = None
 
     with pytest.raises(PaymentStateError):
@@ -402,7 +471,10 @@ def test_concurrent_recovery_accepts_the_same_outcome_already_saved(
 ):
     original = Payment(amount=payment_request.amount, currency=payment_request.currency)
     transaction_id = uuid4() if outcome == "succeeded" else None
-    confirmation = ProcessorResult(status=outcome, transaction_id=transaction_id)
+    confirmation = ProcessorResult(
+        payment_id=original.id, amount=original.amount, currency=original.currency,
+        status=outcome, transaction_id=transaction_id,
+    )
     already_saved = Payment(
         id=original.id,
         amount=original.amount,
@@ -431,7 +503,10 @@ def test_recovery_rejects_a_conflicting_saved_record(
     store, processor, payment_request, difference
 ):
     original = Payment(amount=payment_request.amount, currency=payment_request.currency)
-    confirmation = ProcessorResult(transaction_id=uuid4())
+    confirmation = ProcessorResult(
+        payment_id=original.id, amount=original.amount, currency=original.currency,
+        transaction_id=uuid4(),
+    )
     conflicting = Payment(
         id=original.id,
         amount=original.amount,
