@@ -1,6 +1,9 @@
-These development notes were preserved from the original README. Start with the [current README](../README.md) for setup and the [demo guide](demo.md) for a walkthrough.
+# Engineering notes
 
-# payment-reliability-simulator
+These development notes were preserved from the original README. Start with the
+[current README](../README.md) for setup and the [demo guide](demo.md) for a walkthrough.
+
+## Project scope
 
 A backend learning project using FastAPI, SQLAlchemy, PostgreSQL, and a simulated
 payment provider. The current milestone handles successful and declined payment
@@ -11,28 +14,46 @@ with the internal success update.
 The simulator also demonstrates a completed payment whose response is lost,
 including recovery after the API restarts.
 
-For a fresh checkout, use Python 3.12 and start Docker Desktop, then run:
+## Database initialization and upgrades
+
+For a fresh checkout, follow [Local Setup](../README.md#local-setup). The
+initialization command creates all tables in a fresh database:
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install -r requirements-dev.txt
-docker compose up -d --wait db
 python -m payment_reliability.init_database
-docker compose exec -T db psql -U simulator -d payment_reliability -v ON_ERROR_STOP=1 < migrations/001_add_processor_transaction_id.sql
-python -m uvicorn payment_reliability.main:app --reload
 ```
 
-The SQL migration adds the processor transaction reference to an existing table.
-It can also be run after initializing a fresh database. Both operations preserve
-existing rows. If Docker is missing from your Mac terminal's command search path,
-run `export PATH="$HOME/.docker/bin:$PATH"` in that terminal first.
-
-When upgrading an existing checkout, run
-`python -m payment_reliability.init_database` again to create the new
+For an existing database, the same command creates missing tables, including
 `processor_operations`, `ledger_postings`, `ledger_entries`, and
-`reconciliation_runs` tables. This
-creates missing tables without altering existing tables or payment records.
+`reconciliation_runs`. It preserves existing rows, does not alter existing tables,
+and does not fill in missing financial history.
+
+If the existing `payments` table predates the processor transaction reference,
+run the [SQL migration](../migrations/001_add_processor_transaction_id.sql) from
+the repository root with PostgreSQL running:
+
+```bash
+docker compose exec -T db psql -U simulator -d payment_reliability -v ON_ERROR_STOP=1 < migrations/001_add_processor_transaction_id.sql
+```
+
+The migration adds `processor_transaction_id` and its unique index. It preserves
+existing rows and is safe to repeat, including after fresh initialization; a new
+database already has the current column and index. Neither operation backfills
+provider confirmations, processor references, or ledger entries. Old unresolved
+payments without provider evidence stay unresolved; reconciliation can report
+gaps in successful payment history. Use a fresh key for the current demo.
+
+## Mac Docker PATH troubleshooting
+
+If Docker Desktop's CLI is installed in `$HOME/.docker/bin` but that directory
+is missing from your terminal's command search path, run this in that terminal,
+then retry the Compose command:
+
+```bash
+export PATH="$HOME/.docker/bin:$PATH"
+```
+
+## Payment processing and recovery
 
 The API documentation is available at <http://127.0.0.1:8000/docs>. In another
 terminal, submit a simulated $25 USD payment:
@@ -163,9 +184,10 @@ With the database running and initialized, run the tests:
 python -m pytest -q
 ```
 
-Tests use temporary PostgreSQL schemas for isolated provider histories, removing
-only their own schemas afterward. The simulator's `charge_count` counts successful
-records in its provider store, including records made by previous instances.
+Integration tests clean up their own records or temporary PostgreSQL schemas;
+they do not reset the database. Provider histories use isolated schemas, removed
+afterward. The simulator's `charge_count` counts successful records in its provider
+store, including records made by previous instances.
 
 Both internal payment records and independent provider outcomes persist in
 PostgreSQL. A confirmed decline is a final outcome. If processing instead raises

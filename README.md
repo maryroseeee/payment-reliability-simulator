@@ -1,41 +1,47 @@
 # Payment Reliability & Reconciliation Simulator
 
 A Python backend for testing payment retries, lost responses, and reconciliation.
-The simulated provider saves its results separately from the application's
-payment records. If a response is lost, the application can recover the result
-without submitting another charge. No real money is processed.
+Reliable payment handling distinguishes failed requests from unconfirmed outcomes,
+avoiding duplicate charges and inconsistent records. The provider is simulated;
+no real money is processed.
 
-Built with Python 3.12, FastAPI, SQLAlchemy, PostgreSQL, and Pytest. Docker Compose
-runs PostgreSQL; the API runs in a local Python virtual environment.
+## Quick Demo
 
-The [demo](docs/demo.md) walks through a payment timeout and recovery. The
-[engineering notes](docs/engineering-notes.md) cover the design and database
-upgrades.
+Follow the [demo guide](docs/demo.md), or explore
+[FastAPI Swagger](http://127.0.0.1:8000/docs) after [local setup](#local-setup).
 
-Install Python 3.12 and start Docker Desktop, then run these commands from the
-repository root:
+In the timeout scenario, the provider saves a successful simulated charge, but
+the API returns `503` and leaves the payment `processing`. A matching retry
+returns `409`. The demo covers an API restart, recovery with the original key,
+and verification of one charge.
 
-```bash
-python3.12 -m venv .venv
-source .venv/bin/activate
-python -m pip install -r requirements-dev.txt
-docker compose up -d --wait db
-python -m payment_reliability.init_database
-python -m uvicorn payment_reliability.main:app --reload
-```
+## Key Engineering Features
 
-Open [Swagger](http://127.0.0.1:8000/docs) to send requests. If Docker is
-missing from your Mac terminal's PATH, run
-`export PATH="$HOME/.docker/bin:$PATH"` first. Start and initialize the database
-before starting the API.
+- **PostgreSQL-backed idempotency:** A unique key is reserved before calling the
+  provider. Completed matching retries replay saved results; changed amounts or
+  unresolved payments return `409`.
+- **Persistent provider records:** Outcomes commit to `processor_operations` in a
+  separate transaction, survive API restarts, and remain independent of internal
+  payment status.
+- **Recovery after lost responses:** Recovery reads the saved receipt without
+  another charge, validating payment ID, amount, currency, and consistency between
+  outcome and transaction reference. Missing confirmation leaves `processing`;
+  repeated recovery preserves completed results.
+- **Atomic payment and ledger updates:** Success, processor reference, and a
+  balanced posting commit together: debit processor clearing, credit merchant
+  payable. A ledger write failure rolls back internal success while preserving
+  the independent provider record.
+- **Duplicate-posting prevention:** Uniqueness constraints allow one posting per
+  payment and one entry per accounting side. Posting validation and a shared
+  transaction enforce the complete balanced pair; database constraints check
+  individual rows.
+- **Read-only reconciliation and historical reports:** Checks compare payment,
+  provider, and ledger records in one `REPEATABLE READ, READ ONLY` snapshot.
+  Explicit saves append audit records in a separate transaction, preserving
+  reports and observation times without replacing earlier findings or repairing
+  financial records.
 
-The initialization command creates all tables in a fresh database. It preserves
-existing rows and does not alter existing tables or fill in missing financial
-history. Older databases may need the
-[processor transaction ID migration](docs/engineering-notes.md). Use a new
-payment key when starting the demo.
-
-Requests follow this flow:
+## Architecture Diagram
 
 ```mermaid
 flowchart LR
@@ -55,76 +61,80 @@ flowchart LR
     end
 ```
 
-The main design decisions are:
-
-- PostgreSQL reserves the idempotency key before the provider is called. A retry
-  of a completed payment returns its saved result. A changed amount or a payment
-  still in `processing` returns `409`.
-- The provider saves its result before raising a simulated timeout. That result
-  survives an API restart, even when the internal payment is still `processing`.
-- A successful payment and its balanced ledger posting commit in one database
-  transaction. If a ledger write fails, the success update rolls back too.
-  A unique payment ID on the posting prevents duplicate postings.
-- Recovery reads the provider's saved receipt and checks the payment ID, amount,
-  currency, and transaction reference before saving the result.
-- Reconciliation compares records from one read-only snapshot. Each saved check
-  gets a new audit record, preserving earlier results and their observation times.
+## API Endpoints
 
 | Action | Endpoint | Expected response |
 |---|---|---|
-| Create or retry a payment | `POST /payments` | `201` with the recorded result; conflicts return `409`. |
-| Recover a payment | `POST /payments/recover` | `200` with its current state. |
-| Check payment records | `GET /payments/reconciliation` | `200` with the report and any findings. |
-| Save a reconciliation report | `POST /payments/reconciliation/runs` | `201` with a new run ID, observation time, and report. |
-| Get saved reports | `GET /payments/reconciliation/runs` | `200` with the payment's report history. |
+| Create or retry a payment | `POST /payments` | `201`: saved success or decline; `409`: conflict. |
+| Recover a payment | `POST /payments/recover` | `200`: current payment state. |
+| Check payment records | `GET /payments/reconciliation` | `200`: report and findings. |
+| Save a reconciliation report | `POST /payments/reconciliation/runs` | `201`: run ID, observation time, and report. |
+| Get saved reports | `GET /payments/reconciliation/runs` | `200`: saved report history. |
 
-Every endpoint uses an `Idempotency-Key` header to identify the payment. Only
-`POST /payments` takes a JSON body, for example
-`{"amount":"25.00","currency":"USD"}`. On the saved-run endpoints, the header
-selects the payment. Each POST saves another check, even if the request is
-repeated. Saving a report does not submit another charge.
+Every endpoint requires an `Idempotency-Key` header identifying the payment. Only
+`POST /payments` takes JSON: `{"amount":"25.00","currency":"USD"}`.
+Its `201` records an attempt; `status` describes success or decline.
+For saved runs, the key selects the payment; each POST appends another check.
+GET requests save nothing. A `200` reconciliation report can contain discrepancies.
 
-To try the timeout scenario, stop any running API and restart it with:
+## Tech Stack
+
+Python 3.12, FastAPI, Pydantic, SQLAlchemy, PostgreSQL, and Pytest. PostgreSQL runs
+in Docker Compose; the API runs in a local virtual environment.
+
+## Local Setup
+
+Install Python 3.12, start Docker Desktop, and run from the repository root:
 
 ```bash
-SIMULATE_LOST_RESPONSE=1 SIMULATE_DECLINES=0 python -m uvicorn payment_reliability.main:app --reload
+python3.12 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements-dev.txt
+docker compose up -d --wait db
+python -m payment_reliability.init_database
+python -m uvicorn payment_reliability.main:app --reload
 ```
 
-A new payment returns `503` after the provider saves its result. A matching
-retry returns `409`. Restart the API, recover with the original key, then inspect
-the ledger and saved reports. The [demo guide](docs/demo.md) includes the commands,
-expected responses, and a query to check that only one charge was recorded.
+Use fresh keys for demo payments. See the engineering notes for
+[database upgrades](docs/engineering-notes.md#database-initialization-and-upgrades)
+and [Mac Docker PATH troubleshooting](docs/engineering-notes.md#mac-docker-path-troubleshooting).
 
-With PostgreSQL running and initialized, run the tests:
+## Testing and CI
+
+With PostgreSQL running and initialized:
 
 ```bash
 python -m pytest -q
 ```
 
-The tests cover concurrent requests, lost responses, rollback after failed
-ledger writes, reconciliation discrepancies, and saved report history.
-Integration tests clean up their own records or temporary schemas. The comparison
-tests can run without PostgreSQL:
+Tests cover concurrent requests, lost responses, ledger rollback, reconciliation
+discrepancies, and preserved report history. Comparison tests run without PostgreSQL:
 
 ```bash
 python -m pytest tests/test_reconciliation.py -q
 ```
 
-The [CI workflow](.github/workflows/tests.yml) is configured to initialize
-PostgreSQL 18.6 and run the tests with Python 3.12 on pushes and pull requests.
+The [GitHub Actions workflow](.github/workflows/tests.yml) initializes
+PostgreSQL 18.6 and runs Pytest with Python 3.12 on pushes and pull requests.
 
-The MVP supports USD, single-step simulated charges, success and decline
-results, and manual recovery. Reconciliation checks one successful payment at a
-time. Authorization, capture, voids, refunds, batch reconciliation, and automatic
-repairs are outside the current scope.
+## Limitations
 
-The provider and application share one PostgreSQL database, which allows
-reconciliation to read both from the same snapshot. The application only inserts
-or reads ledger and audit records. Posting validation and database transactions
-enforce the accounting rules, with database constraints checking uniqueness and
-individual rows.
+The MVP supports USD, single-step simulated charges, success, decline, and manual
+recovery. Reconciliation checks one successful payment at a time.
+Authorization, capture, voids, refunds, batch reconciliation, and automatic
+repairs are outside scope.
 
-The interface is Swagger and the HTTP API. A dashboard, authentication, and
-production deployment are outside the MVP. Older development records may have
-missing provider or ledger history; reconciliation reports those gaps without
-changing the records.
+Provider and application records share one PostgreSQL database, enabling a shared
+reconciliation snapshot. This local simulation does not implement real distributed
+payment infrastructure or a production-ready processor. The interface is Swagger
+and HTTP; dashboard, authentication, and production deployment are outside scope.
+
+Application code only inserts or reads ledger and audit records. Older development
+records may lack provider or ledger history; reconciliation reports gaps without
+repairing records or inventing history.
+
+## Additional Documentation
+
+- [Demo guide](docs/demo.md): commands, responses, and record verification.
+- [Engineering notes](docs/engineering-notes.md): transactions, recovery semantics,
+  reconciliation, database upgrades, and troubleshooting.
