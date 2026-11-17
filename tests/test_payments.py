@@ -6,7 +6,9 @@ from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy.exc import SQLAlchemyError
 
+import payment_reliability.store as payment_store_module
 from payment_reliability.database import engine
 from payment_reliability.main import app, get_payment_service
 from payment_reliability.processor import ProcessorError, SimulatedPaymentProcessor
@@ -74,18 +76,24 @@ def test_api_rejects_invalid_payment_amount(client, api_processor, idempotency_k
 
 
 def test_completed_retry_returns_the_same_response_without_another_charge(
-    client, api_processor, idempotency_key
+    client, api_processor, idempotency_key, ledger_records
 ):
     payload = {"amount": "25.00", "currency": "USD"}
     headers = {"Idempotency-Key": idempotency_key}
 
     original = client.post("/payments", headers=headers, json=payload)
+    stored = PaymentStore(engine).get_by_idempotency_key(idempotency_key)
+    assert stored is not None
+    original_ledger = ledger_records(stored.id)
     retry = client.post("/payments", headers=headers, json=payload)
 
     assert original.status_code == 201
     assert retry.status_code == 201
     assert retry.json() == original.json()
     assert api_processor.charge_count == 1
+    assert len(original_ledger[0]) == 1
+    assert len(original_ledger[1]) == 2
+    assert ledger_records(stored.id) == original_ledger
 
 
 def test_changed_amount_returns_conflict_and_preserves_the_original(
@@ -224,7 +232,7 @@ def test_processor_error_leaves_processing_and_does_not_blindly_retry(
 
 
 def test_decline_is_saved_and_replayed_without_another_attempt(
-    client, api_processor, idempotency_key, monkeypatch
+    client, api_processor, idempotency_key, monkeypatch, ledger_records
 ):
     api_processor.decline = True
     process = Mock(wraps=api_processor.process)
@@ -248,6 +256,7 @@ def test_decline_is_saved_and_replayed_without_another_attempt(
     assert str(stored.id) == original.json()["id"]
     assert stored.status == "declined"
     assert stored.processor_transaction_id is None
+    assert ledger_records(stored.id) == ([], [])
 
 
 def test_new_key_creates_a_new_attempt_and_preserves_the_original_decline(
@@ -461,7 +470,7 @@ def test_recovery_lookup_failure_returns_unconfirmed_and_keeps_processing(
 @pytest.mark.parametrize("difference", ["amount", "payment_id"])
 @pytest.mark.parametrize("outcome", ["succeeded", "declined"])
 def test_recovery_rejects_disagreeing_provider_records_without_changing_them(
-    client, api_processor, idempotency_key, monkeypatch, difference, outcome
+    client, api_processor, idempotency_key, monkeypatch, difference, outcome, ledger_records
 ):
     store = PaymentStore(engine)
     original = store.claim(
@@ -492,10 +501,53 @@ def test_recovery_rejects_disagreeing_provider_records_without_changing_them(
         saved = store.get_by_idempotency_key(idempotency_key)
         assert saved is not None
         assert saved.model_dump() == original.model_dump()
+        assert ledger_records(original.id) == ([], [])
         assert api_processor.get_result(idempotency_key) == confirmation
         assert api_processor.charge_count == (1 if outcome == "succeeded" else 0)
 
     process.assert_not_called()
+
+
+def test_ledger_storage_failure_returns_unconfirmed_and_recovery_posts_once(
+    client, api_processor, idempotency_key, monkeypatch, ledger_records
+):
+    original_save = payment_store_module.save_posting
+
+    def fail_before_commit(connection, posting):
+        original_save(connection, posting)
+        raise SQLAlchemyError("Injected ledger failure before commit.")
+
+    headers = {"Idempotency-Key": idempotency_key}
+    payload = {"amount": "25.00", "currency": "USD"}
+    with monkeypatch.context() as patch:
+        patch.setattr(payment_store_module, "save_posting", fail_before_commit)
+        failure = client.post("/payments", headers=headers, json=payload)
+
+    assert failure.status_code == 503
+    assert failure.json()["detail"]["code"] == "outcome_unconfirmed"
+    payment = PaymentStore(engine).get_by_idempotency_key(idempotency_key)
+    assert payment is not None
+    assert payment.status == "processing"
+    assert payment.processor_transaction_id is None
+    assert ledger_records(payment.id) == ([], [])
+    confirmation = api_processor.get_result(idempotency_key)
+    assert confirmation is not None
+    assert api_processor.charge_count == 1
+
+    recovered = client.post("/payments/recover", headers=headers)
+
+    assert recovered.status_code == 200
+    assert recovered.json()["status"] == "succeeded"
+    assert recovered.json()["id"] == str(payment.id)
+    assert recovered.json()["processor_transaction_id"] == str(confirmation.transaction_id)
+    saved_ledger = ledger_records(payment.id)
+    assert len(saved_ledger[0]) == 1
+    assert len(saved_ledger[1]) == 2
+    retry = client.post("/payments", headers=headers, json=payload)
+    assert retry.status_code == 201
+    assert retry.json() == recovered.json()
+    assert ledger_records(payment.id) == saved_ledger
+    assert api_processor.charge_count == 1
 
 
 @pytest.mark.parametrize("key", [None, "", "   "])

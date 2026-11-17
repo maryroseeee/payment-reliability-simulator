@@ -6,6 +6,8 @@ from sqlalchemy import select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.engine import Engine
 
+from payment_reliability.ledger import build_payment_posting
+from payment_reliability.ledger_store import save_posting
 from payment_reliability.models import PaymentRecord
 from payment_reliability.schemas import Payment, PaymentRequest
 
@@ -55,7 +57,7 @@ class PaymentStore:
     def mark_succeeded(
         self, payment_id: UUID, processor_transaction_id: UUID
     ) -> Payment | None:
-        """Commit processing -> succeeded, or return None if it cannot apply."""
+        """Commit success and its ledger together, or None if it cannot apply."""
         if processor_transaction_id is None:
             raise ValueError("Successful payments require a processor transaction ID.")
 
@@ -76,6 +78,7 @@ class PaymentStore:
             if row is None:
                 return None
             payment = Payment.model_validate(row)
+            save_posting(connection, build_payment_posting(payment))
 
         return payment
 

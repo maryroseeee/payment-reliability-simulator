@@ -1,184 +1,130 @@
-# payment-reliability-simulator
+# Payment Reliability & Reconciliation Simulator
 
-A backend learning project using FastAPI, SQLAlchemy, PostgreSQL, and a simulated
-payment provider. The current milestone handles successful and declined payment
-attempts: reserve an idempotency key, obtain a confirmed simulator outcome, save
-it, and replay that saved outcome on matching retries. Successful payments also
-retain the processor transaction ID.
-The simulator also demonstrates a completed payment whose response is lost,
-including recovery after the API restarts.
+A Python backend for testing payment retries, lost responses, and reconciliation.
+The simulated provider saves its results separately from the application's
+payment records. If a response is lost, the application can recover the result
+without submitting another charge. No real money is processed.
 
-For a fresh checkout, use Python 3.12 and start Docker Desktop, then run:
+Built with Python 3.12, FastAPI, SQLAlchemy, PostgreSQL, and Pytest. Docker Compose
+runs PostgreSQL; the API runs in a local Python virtual environment.
+
+The [demo](docs/demo.md) walks through a payment timeout and recovery. The
+[engineering notes](docs/engineering-notes.md) cover the design and database
+upgrades.
+
+Install Python 3.12 and start Docker Desktop, then run these commands from the
+repository root:
 
 ```bash
-python3 -m venv .venv
+python3.12 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements-dev.txt
 docker compose up -d --wait db
 python -m payment_reliability.init_database
-docker compose exec -T db psql -U simulator -d payment_reliability -v ON_ERROR_STOP=1 < migrations/001_add_processor_transaction_id.sql
 python -m uvicorn payment_reliability.main:app --reload
 ```
 
-The SQL migration adds the processor transaction reference to an existing table.
-It can also be run after initializing a fresh database. Both operations preserve
-existing rows. If Docker is missing from your Mac terminal's command search path,
-run `export PATH="$HOME/.docker/bin:$PATH"` in that terminal first.
+Open [Swagger](http://127.0.0.1:8000/docs) to send requests. If Docker is
+missing from your Mac terminal's PATH, run
+`export PATH="$HOME/.docker/bin:$PATH"` first. Start and initialize the database
+before starting the API.
 
-When upgrading an existing checkout, run
-`python -m payment_reliability.init_database` again to create the new
-`processor_operations` table. This creates missing tables without altering
-existing tables or payment records.
+The initialization command creates all tables in a fresh database. It preserves
+existing rows and does not alter existing tables or fill in missing financial
+history. Older databases may need the
+[processor transaction ID migration](docs/engineering-notes.md). Use a new
+payment key when starting the demo.
 
-The API documentation is available at <http://127.0.0.1:8000/docs>. In another
-terminal, submit a simulated $25 USD payment:
+Requests follow this flow:
 
-```bash
-curl -i http://127.0.0.1:8000/payments \
-  -H 'Content-Type: application/json' \
-  -H 'Idempotency-Key: demo-order-42' \
-  -d '{"amount":"25.00","currency":"USD"}'
+```mermaid
+flowchart LR
+    C["Swagger / HTTP client"] --> API["FastAPI"]
+    API --> P["PaymentService"]
+    P --> S["Provider simulator"]
+    S -->|independent commit| PR["processor_operations"]
+    P -->|atomic internal commit| PL["payments + ledger"]
+    API --> R["Reconciliation"]
+    R -->|read one snapshot| PR
+    R -->|read one snapshot| PL
+    R -->|explicit save action| H["reconciliation_runs"]
+    subgraph PG["One PostgreSQL database"]
+        PR
+        PL
+        H
+    end
 ```
 
-The default response is `201` with a payment ID, decimal amount, currency,
-`succeeded` status, and `processor_transaction_id`. Repeat the same command to
-replay the same `201` response and IDs. A different intended payment needs a new
-key.
+The main design decisions are:
 
-To make new attempts decline, stop the API and restart it with:
+- PostgreSQL reserves the idempotency key before the provider is called. A retry
+  of a completed payment returns its saved result. A changed amount or a payment
+  still in `processing` returns `409`.
+- The provider saves its result before raising a simulated timeout. That result
+  survives an API restart, even when the internal payment is still `processing`.
+- A successful payment and its balanced ledger posting commit in one database
+  transaction. If a ledger write fails, the success update rolls back too.
+  A unique payment ID on the posting prevents duplicate postings.
+- Recovery reads the provider's saved receipt and checks the payment ID, amount,
+  currency, and transaction reference before saving the result.
+- Reconciliation compares records from one read-only snapshot. Each saved check
+  gets a new audit record, preserving earlier results and their observation times.
 
-```bash
-SIMULATE_DECLINES=1 python -m uvicorn payment_reliability.main:app --reload
-```
+| Action | Endpoint | Expected response |
+|---|---|---|
+| Create or retry a payment | `POST /payments` | `201` with the recorded result; conflicts return `409`. |
+| Recover a payment | `POST /payments/recover` | `200` with its current state. |
+| Check payment records | `GET /payments/reconciliation` | `200` with the report and any findings. |
+| Save a reconciliation report | `POST /payments/reconciliation/runs` | `201` with a new run ID, observation time, and report. |
+| Get saved reports | `GET /payments/reconciliation/runs` | `200` with the payment's report history. |
 
-Submit the request using a new key. A recorded decline returns `201` with status
-`declined` and a null `processor_transaction_id`. Here `201` means the payment
-attempt was recorded; the response's `status` describes its financial outcome.
-Matching retries return the same decline, even after restarting the API in its
-default successful mode. To intentionally try again, use another new key. The
-original declined attempt retains its own payment ID and outcome.
+Every endpoint uses an `Idempotency-Key` header to identify the payment. Only
+`POST /payments` takes a JSON body, for example
+`{"amount":"25.00","currency":"USD"}`. On the saved-run endpoints, the header
+selects the payment. Each POST saves another check, even if the request is
+repeated. Saving a report does not submit another charge.
 
-Changing the amount under that key returns `409` with code
-`idempotency_conflict`. A matching request whose payment is still processing
-returns `409` with code `payment_in_progress`. Missing or blank keys and invalid
-amounts return `422`.
-
-To simulate a recorded payment whose first response is lost, restart the API with:
-
-```bash
-SIMULATE_LOST_RESPONSE=1 python -m uvicorn payment_reliability.main:app --reload
-```
-
-Submit a request with a fresh key. In the default successful mode, the simulator
-records one charge, then raises a timeout instead of returning its confirmation.
-The API returns `503` with code `outcome_unconfirmed`, while the internal payment
-remains `processing` with no processor transaction reference. A matching API retry
-returns `409` with code `payment_in_progress` and starts no second charge.
-
-This deterministic mode loses the first response for each new operation; it does
-not wait for a real network timeout. The simulator's `get_result(key)` operation
-can inspect the recorded outcome without processing another payment. That lookup
-reads the provider's own `processor_operations` table in PostgreSQL.
-
-Each provider record stores the idempotency key, internal payment ID as a
-reference, amount, currency, confirmed outcome, and processor transaction ID
-(null for a decline). A unique key prevents duplicate provider operations across
-simulator instances. The provider commits its record before simulating a lost
-response; the service saves the internal outcome in a separate transaction.
-That separation allows a provider charge to exist while the internal payment is
-still `processing`.
-
-Both tables share one local PostgreSQL database to keep the project small. The
-provider never derives its outcome from the internal payment status and has no
-foreign key to the internal table. Provider records are inserted and read through
-`ProcessorStore`; there is no update or delete operation in that component.
-
-`PaymentService.recover_payment(key)` can now read that confirmation and save the
-known successful or declined outcome without calling `process()` or creating a
-new payment. It preserves the internal payment ID and, for success, saves the
-original processor transaction reference. Repeating recovery after completion
-returns the saved outcome. If lookup finds no confirmation, the record remains
-`processing`; lookup errors also leave it unresolved.
-
-The provider confirmation includes payment ID, amount, and currency alongside its
-outcome and transaction ID. Before saving either success or decline, the service
-compares these details against the internal payment. A disagreement raises a
-consistency error and leaves both records unchanged. This check applies to the
-initial provider response as well as recovery. Recovery reports `503` with code
-`outcome_unconfirmed` for a mismatch; it does not submit another charge or
-overwrite either record to make them agree.
-
-If concurrent recovery calls find the same confirmation, one updates the record.
-The other rereads the internal payment and accepts it only when its identity,
-amount, currency, outcome, and processor reference match. A disagreement raises
-a consistency error rather than overwriting the saved record.
-
-To recover through the API, call `POST /payments/recover` with the same
-`Idempotency-Key` header and no request body. You can restart the API between the
-lost-response request and recovery; the provider confirmation survives:
+To try the timeout scenario, stop any running API and restart it with:
 
 ```bash
-curl -i -X POST http://127.0.0.1:8000/payments/recover \
-  -H 'Idempotency-Key: your-lost-response-key'
+SIMULATE_LOST_RESPONSE=1 SIMULATE_DECLINES=0 python -m uvicorn payment_reliability.main:app --reload
 ```
 
-Use the actual key from the earlier failed request. Recovery returns `200` with
-the existing payment and its current state. A known confirmation is saved as
-`succeeded` or `declined`; a missing provider result returns the payment still
-`processing`. No new charge is started. Repeating recovery returns the same
-completed outcome. After successful recovery, repeating the original payment
-request replays that saved result with `201`.
+A new payment returns `503` after the provider saves its result. A matching
+retry returns `409`. Restart the API, recover with the original key, then inspect
+the ledger and saved reports. The [demo guide](docs/demo.md) includes the commands,
+expected responses, and a query to check that only one charge was recorded.
 
-An unknown internal key returns `404` with code `payment_not_found`. Missing or
-blank headers return `422`. Processor lookup, database, or consistency errors
-return `503` with code `outcome_unconfirmed`.
-
-In Swagger at <http://127.0.0.1:8000/docs>, expand **POST /payments/recover**,
-click **Try it out**, enter the same key in **Idempotency-Key**, and click
-**Execute**. Recovery takes no amount or currency body.
-
-For the restart demo, submit a fresh payment while lost-response mode is enabled
-and confirm the `503`. Stop the server with Ctrl+C, start it again with
-`python -m uvicorn payment_reliability.main:app --reload`, then recover using the
-same key. The result should be `200` with `succeeded` and the original provider
-transaction ID. Repeating recovery returns the same result.
-
-Old unresolved payments from the earlier in-memory simulator may have no provider
-record. They remain unresolved: the upgrade does not invent a confirmation from
-internal payment data. Use a fresh key for this demo.
-
-Run the PostgreSQL-backed recovery scenarios with:
-
-```bash
-python -m pytest tests/test_recovery.py -q
-```
-
-With the database running and initialized, run the tests:
+With PostgreSQL running and initialized, run the tests:
 
 ```bash
 python -m pytest -q
 ```
 
-Tests use temporary PostgreSQL schemas for isolated provider histories, removing
-only their own schemas afterward. The simulator's `charge_count` counts successful
-records in its provider store, including records made by previous instances.
+The tests cover concurrent requests, lost responses, rollback after failed
+ledger writes, reconciliation discrepancies, and saved report history.
+Integration tests clean up their own records or temporary schemas. The comparison
+tests can run without PostgreSQL:
 
-Both internal payment records and independent provider outcomes persist in
-PostgreSQL. A confirmed decline is a final outcome. If processing instead raises
-an error, the API returns `503` and retains `processing`; retries do not call the
-simulator again.
+```bash
+python -m pytest tests/test_reconciliation.py -q
+```
 
-The first ledger component is available in `payment_reliability/ledger.py`.
-`build_payment_posting(payment)` prepares two entries: a debit to processor
-clearing (simulated funds held) and a credit to merchant payable (funds owed).
-The posting carries the payment ID, expected amount, and USD currency. Validation
-requires exactly those two accounting sides, equal debit and credit amounts,
-and amounts that match the payment. The posting and its entries are frozen
-Pydantic models to prevent ordinary field edits after construction.
+The [CI workflow](.github/workflows/tests.yml) is configured to initialize
+PostgreSQL 18.6 and run the tests with Python 3.12 on pushes and pull requests.
 
-This component currently prepares data only. The API does not yet save ledger
-postings, and building a posting does not confirm a charge or change payment
-status. Database storage, a unique posting per payment, and committing the ledger
-with the internal success update in one transaction are the next ledger step.
-Run its rules independently with `python -m pytest tests/test_ledger.py -q`.
-Automatic recovery of unresolved records and reconciliation are later milestones.
+The MVP supports USD, single-step simulated charges, success and decline
+results, and manual recovery. Reconciliation checks one successful payment at a
+time. Authorization, capture, voids, refunds, batch reconciliation, and automatic
+repairs are outside the current scope.
+
+The provider and application share one PostgreSQL database, which allows
+reconciliation to read both from the same snapshot. The application only inserts
+or reads ledger and audit records. Posting validation and database transactions
+enforce the accounting rules, with database constraints checking uniqueness and
+individual rows.
+
+The interface is Swagger and the HTTP API. A dashboard, authentication, and
+production deployment are outside the MVP. Older development records may have
+missing provider or ledger history; reconciliation reports those gaps without
+changing the records.

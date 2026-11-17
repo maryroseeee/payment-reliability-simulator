@@ -17,7 +17,7 @@ from payment_reliability.store import PaymentStore
 
 @pytest.mark.parametrize("decline", [False, True])
 def test_recovery_restores_a_lost_outcome_without_another_attempt(
-    idempotency_key, monkeypatch, decline, provider_store
+    idempotency_key, monkeypatch, decline, provider_store, ledger_records
 ):
     processor = SimulatedPaymentProcessor(provider_store, decline=decline, lose_response=True)
     process = Mock(wraps=processor.process)
@@ -31,6 +31,7 @@ def test_recovery_restores_a_lost_outcome_without_another_attempt(
     unresolved = store.get_by_idempotency_key(idempotency_key)
     assert unresolved is not None
     assert unresolved.status == "processing"
+    assert ledger_records(unresolved.id) == ([], [])
     confirmation = processor.get_result(idempotency_key)
     assert confirmation is not None
     expected_charges = 0 if decline else 1
@@ -47,6 +48,9 @@ def test_recovery_restores_a_lost_outcome_without_another_attempt(
     persisted = store.get_by_idempotency_key(idempotency_key)
     assert persisted is not None
     assert persisted.model_dump() == recovered.model_dump()
+    saved_ledger = ledger_records(recovered.id)
+    assert len(saved_ledger[0]) == (0 if decline else 1)
+    assert len(saved_ledger[1]) == (0 if decline else 2)
 
     repeated = service.recover_payment(idempotency_key)
     replayed = service.process_payment(idempotency_key, request)
@@ -54,6 +58,7 @@ def test_recovery_restores_a_lost_outcome_without_another_attempt(
     assert replayed.model_dump() == recovered.model_dump()
     assert process.call_count == 1
     assert processor.charge_count == expected_charges
+    assert ledger_records(recovered.id) == saved_ledger
 
 
 @pytest.mark.parametrize("decline", [False, True])
@@ -116,7 +121,7 @@ def test_missing_provider_history_does_not_trigger_another_payment(
 
 @pytest.mark.parametrize("decline", [False, True])
 def test_concurrent_recoveries_return_the_same_saved_outcome(
-    idempotency_key, monkeypatch, decline, provider_store
+    idempotency_key, monkeypatch, decline, provider_store, ledger_records
 ):
     processor = SimulatedPaymentProcessor(provider_store, decline=decline, lose_response=True)
     process = Mock(wraps=processor.process)
@@ -149,3 +154,6 @@ def test_concurrent_recoveries_return_the_same_saved_outcome(
     assert results[0].status == ("declined" if decline else "succeeded")
     assert process.call_count == 1
     assert processor.charge_count == (0 if decline else 1)
+    postings, entries = ledger_records(original.id)
+    assert len(postings) == (0 if decline else 1)
+    assert len(entries) == (0 if decline else 2)

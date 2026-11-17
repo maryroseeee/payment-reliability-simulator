@@ -10,7 +10,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
 from payment_reliability.database import engine
-from payment_reliability.models import PaymentRecord
+from payment_reliability.models import LedgerEntryRecord, LedgerPostingRecord, PaymentRecord
 from payment_reliability.schemas import PaymentRequest
 from payment_reliability.store import PaymentStore
 
@@ -120,6 +120,14 @@ def test_confirmed_success_is_committed_and_preserves_payment_details(idempotenc
         row = observer.execute(
             select(PaymentRecord).where(PaymentRecord.id == original.id)
         ).mappings().one()
+        posting = observer.execute(
+            select(LedgerPostingRecord).where(LedgerPostingRecord.payment_id == original.id)
+        ).mappings().one()
+        entries = observer.execute(
+            select(LedgerEntryRecord)
+            .where(LedgerEntryRecord.posting_id == posting["id"])
+            .order_by(LedgerEntryRecord.direction)
+        ).mappings().all()
 
     assert completed is not None
     assert completed.id == original.id
@@ -130,6 +138,12 @@ def test_confirmed_success_is_committed_and_preserves_payment_details(idempotenc
     assert row["status"] == "succeeded"
     assert row["idempotency_key"] == idempotency_key
     assert row["processor_transaction_id"] == transaction_id
+    assert posting["amount"] == original.amount
+    assert posting["currency"] == original.currency
+    assert [(entry["account"], entry["direction"], entry["amount"]) for entry in entries] == [
+        ("merchant_payable", "credit", Decimal("25.00")),
+        ("processor_clearing", "debit", Decimal("25.00")),
+    ]
 
 
 def test_unknown_payment_cannot_be_completed(idempotency_key):
