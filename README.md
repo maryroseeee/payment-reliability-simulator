@@ -41,25 +41,58 @@ and verification of one charge.
   reports and observation times without replacing earlier findings or repairing
   financial records.
 
+
 ## Architecture Diagram
 
 ```mermaid
-flowchart LR
-    C["Swagger / HTTP client"] --> API["FastAPI"]
-    API --> P["PaymentService"]
-    P --> S["Provider simulator"]
-    S -->|independent commit| PR["processor_operations"]
-    P -->|atomic internal commit| PL["payments + ledger"]
-    API --> R["Reconciliation"]
-    R -->|read one snapshot| PR
-    R -->|read one snapshot| PL
-    R -->|explicit save action| H["reconciliation_runs"]
-    subgraph PG["One PostgreSQL database"]
-        PR
-        PL
-        H
+flowchart TB
+    C["HTTP client / Swagger"] --> API
+
+    subgraph APP["Python application"]
+        API["FastAPI"]
+        PS["PaymentService"]
+        ST["PaymentStore"]
+        SIM["In-process provider simulator"]
+        REC["Reconciliation"]
+
+        API -->|Payment / recovery| PS
+        API -->|Check / save report| REC
+        PS -->|Claim / finalize| ST
+        PS -->|Process / recover outcome| SIM
     end
-```
+
+    subgraph DB["One PostgreSQL database"]
+        PAY[("payments")]
+        OPS[("processor_operations")]
+        LED[("ledger_postings + ledger_entries")]
+        RUN[("reconciliation_runs")]
+    end
+
+    ST -->|Reserve / update| PAY
+    ST -->|Success only| LED
+    SIM -->|Commit / lookup| OPS
+
+    REC -.->|Read-only snapshot| PAY
+    REC -.-> OPS
+    REC -.-> LED
+    REC -->|Save audit report| RUN
+``` 
+
+
+### Transaction Boundaries
+
+A new payment is processed through three separate database commits:
+
+1. **Payment reservation:** `PaymentService` reserves the idempotency key by inserting a `processing` record into `payments`.
+2. **Provider outcome:** The in-process provider simulator independently commits a successful or declined outcome to `processor_operations`.
+3. **Payment finalization:** For a successful payment, `PaymentStore.mark_succeeded()` updates the payment status and inserts a balanced ledger posting with two entries in one atomic transaction. Declined payments update their status without creating ledger entries.
+
+If the provider's response is lost after its commit, the internal payment remains `processing`. Recovery reads the saved provider outcome and finalizes the payment without initiating another charge.
+
+Reconciliation reads payment, provider, and ledger records from a single `REPEATABLE READ, READ ONLY` PostgreSQL snapshot. Saving a reconciliation report creates a separate transaction that appends to `reconciliation_runs` without modifying financial records.
+
+The provider simulator and application share one PostgreSQL database but use separate transactions. No external payment provider or real payment processing is involved.
+
 
 ## API Endpoints
 
